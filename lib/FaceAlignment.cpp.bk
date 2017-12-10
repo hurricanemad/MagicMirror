@@ -1,0 +1,188 @@
+#include "FaceAlignment.hpp"
+
+
+namespace FA{
+    FaceAlignmentInput::FaceAlignmentInput(int nMaxFaceNum, 
+                                           const string& strClnModelDir, 
+                                           const string& strFAModelDir, 
+                                           const string& strFATrainFileDir){
+        m_vsptrCLNFModels.resize(nMaxFaceNum);
+        //m_sptrOPFace.resize(nMaxFaceNum);
+        for(int i = 0; i < nMaxFaceNum; ++i){
+            m_vsptrCLNFModels[i] = std::make_shared<CLNF>(strClnModelDir);
+        }
+        
+        m_sptrOPFace = std::make_shared<OPFace>();
+        if(!m_sptrOPFace->load_model({strFAModelDir}, {strFATrainFileDir}))
+        {
+            cout <<"Load alignment model failed!" << endl;
+            exit(-1);
+        }
+        
+        m_vTrackingInfo.resize(nMaxFaceNum);
+        
+        m_fmpModelParam.reinit_video_every = 4;
+        m_fmpModelParam.use_face_template = true;
+        m_fmpModelParam.multi_view = false;
+        m_fmpModelParam.sigma = 1.5;
+        m_fmpModelParam.reg_factor = 25;
+        m_fmpModelParam.weight_factor = 0;
+        m_fmpModelParam.validation_boundary = -0.6;
+        
+        nFrameCount = 0;
+        nDetectFrequency = 8;
+    }
+    
+    void FaceAlignmentInput::detect(){
+        cout << "FaceAlignmentInput detect start!" << endl;
+        cout << "m_vsptrCLNFModels's size is:" << m_vsptrCLNFModels.size() <<endl;
+        if(m_matCameraFrame.empty() || !(m_vrectFaceRect.size())){
+            cout << "FaceAlignmentInput detect function input error!" << endl;
+            return ;
+        }
+        
+        Mat matGrayCameraFrame;
+        cvtColor(m_matCameraFrame, matGrayCameraFrame, CV_BGR2GRAY);
+        
+        bool bAllModelsActive = true;
+        for(unsigned int i = 0; i < m_vsptrCLNFModels.size(); ++i)
+        {
+            if(!m_vTrackingInfo[i].tracking_)
+            {
+                bAllModelsActive = false;
+            }
+        }
+        
+        if(nFrameCount % nDetectFrequency == 0 && !bAllModelsActive)
+        {
+            RemoveOverlapRect(m_vsptrCLNFModels, m_vflmFiveInitLandmarks);
+
+        }
+        
+        vector<std::atomic<bool>> vatbDetectionsUsed(m_vflmFiveInitLandmarks.size());
+        bool bExpected = true;
+
+        /**init tracker*/
+#pragma omp parallel for num_threads(CL_NUM_THREADS)
+        for(unsigned int i = 0; i < m_vsptrCLNFModels.size(); ++i) {
+            if (m_vsptrCLNFModels[i]->failures_in_a_row > 6) {
+                m_vTrackingInfo[i].reset();
+                m_vsptrCLNFModels[i]->Reset();
+            }
+
+            if (!m_vTrackingInfo[i].tracking_) {
+                for (size_t j = 0; j < m_vflmFiveInitLandmarks.size(); ++j) {
+                    if(!vatbDetectionsUsed[j].compare_exchange_weak(bExpected, false)) {
+                        m_vsptrCLNFModels[i]->Reset();
+                        m_vsptrCLNFModels[i]->detection_success = false;
+
+
+                        init_tracker(matGrayCameraFrame,
+                                     m_vflmFiveInitLandmarks[j].points_,
+                                     *m_vsptrCLNFModels[i].get(),
+                                     m_fmpModelParam);
+                        m_vTrackingInfo[i].tracking_ = true;
+                        break;
+                    }
+                }
+            }
+        }
+            /**batch gpu alignment*/
+        m_sptrOPFace->detect(m_matCameraFrame, GetAllRect(m_vsptrCLNFModels), m_vflmPerFrameLandmarks);
+#pragma omp parallel for num_threads(CL_NUM_THREADS)
+        for(unsigned int i = 0; i < m_vsptrCLNFModels.size(); ++i) {
+            if (m_vTrackingInfo[i].tracking_) {
+                update_tracker(matGrayCameraFrame,
+                               m_vflmPerFrameLandmarks[i].points_,
+                               *m_vsptrCLNFModels[i].get(),
+                               m_fmpModelParam);
+            }
+        }
+//#pragma omp parallel for num_threads(CL_NUM_THREADS)
+        /*CLNF tempCLNF;
+        for(int model = 0; model < m_vsptrCLNFModels.size(); ++model){
+            if (m_vTrackingInfo[model].tracking_){
+
+            if(m_vsptrCLNFModels[model]->detection_certainty < -0.8)
+            {
+                //Mat src_display_temp = src_display;
+                //LandmarkDetector::Draw(src_display_temp, *clnf_models[model].get());
+                tempCLNF = *clnf_models[model].get();
+            }
+
+        }*/
+        
+        for(size_t model=0; model < m_vsptrCLNFModels.size(); ++model)
+        {
+            m_vsptrCLNFModels[model]->Reset();
+            m_vTrackingInfo[model].reset();
+        }
+
+        nFrameCount = nFrameCount++ % INT_MAX; 
+    }
+    
+    vector<cl::FaceBox> FaceAlignmentInput::GetAllRect(const vector<shared_ptr<CLNF>>& vsptrCLNFModels){
+        vector<cl::FaceBox> results(vsptrCLNFModels.size());
+        for(size_t i = 0; i < vsptrCLNFModels.size(); ++i)
+        {
+            auto model_rect = vsptrCLNFModels[i]->get_bbox();
+            results[i] = (cl::FaceBox(model_rect, 1.f));
+        }
+        return results;
+    }
+    
+    void FaceAlignmentInput::SetFiveInitLandmarks(vector<float>& vfFaceConfidence, std::vector<std::vector<cv::Point> >&vvptFaceAlign){
+        if(m_vflmFiveInitLandmarks.size()){
+            m_vflmFiveInitLandmarks.clear();
+        }
+        
+        m_vflmFiveInitLandmarks.resize(vfFaceConfidence.size());
+        int m, n;
+        for(n = 0; n < vvptFaceAlign.size(); n++){
+           m_vflmFiveInitLandmarks[n].points_.resize(vvptFaceAlign[n].size());
+           m_vflmFiveInitLandmarks[n].scores_.resize(vvptFaceAlign[n].size());
+           for(m = 0; m < vvptFaceAlign[n].size(); m++){
+               m_vflmFiveInitLandmarks[n].points_[m] = cv::Point2f(vvptFaceAlign[n][m].x, vvptFaceAlign[n][m].y);
+               m_vflmFiveInitLandmarks[n].scores_[m] = vfFaceConfidence[n];
+            }
+        }
+    }
+    
+    void FaceAlignmentInput::RemoveOverlapRect(const vector<shared_ptr<CLNF>>& vsptrCLNFModels,
+                                               vector<cl::FaceLandmark>& vflmLandmarks){
+        const double thresh = 0.5f;
+        for(size_t i = 0; i < vsptrCLNFModels.size(); ++i)
+        {
+            cv::Rect_<double> model_rect = vsptrCLNFModels[i]->GetBoundingBox();
+            for(int j = vflmLandmarks.size()-1; j >=0; --j)
+            {
+                Rect_<double> landmark_rect = cl::fa::landmark2rect(vflmLandmarks[j]);
+                double intersection_area = (model_rect & landmark_rect).area();
+                double union_area = model_rect.area() + landmark_rect.area() - 2 * intersection_area;
+                if( intersection_area/union_area > thresh)
+                {
+                    vflmLandmarks.erase(vflmLandmarks.begin() + j);
+                }
+            }
+        }
+    }
+    
+    vector<cl::FaceLandmark> FaceAlignmentInput::GetPerFrameLandmarks(){
+        return m_vflmPerFrameLandmarks;
+    }
+    
+    void FaceAlignmentInput::SetMatCameraFrame(const Mat& matCameraFrame){
+        m_matCameraFrame = matCameraFrame;
+    }
+    void FaceAlignmentInput::SetFaceRect(const vector<Rect>& vrectFaceRect){
+        m_vrectFaceRect = vrectFaceRect;
+    }
+    
+    Mat FaceAlignmentInput::GetMatCameraFrame(){
+        return m_matCameraFrame;
+    }
+    
+    vector<Rect> FaceAlignmentInput::GetFaceRect(){
+        return m_vrectFaceRect;
+    }
+}

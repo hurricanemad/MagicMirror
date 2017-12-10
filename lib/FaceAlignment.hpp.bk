@@ -1,0 +1,65 @@
+#ifndef FACE_ALIGNMENT
+#define FACE_ALIGNMENT
+
+// 3rdparty dependencies
+// GFlags: DEFINE_bool, _int32, _int64, _uint64, _double, _string
+#include <gflags/gflags.h>
+// Allow Google Flags in Ubuntu 14
+#ifndef GFLAGS_GFLAGS_H_
+    namespace gflags = google;
+#endif
+    
+// OpenPose dependencies
+#include <openpose/core/headers.hpp>
+#include <openpose/filestream/headers.hpp>
+#include <openpose/gui/headers.hpp>
+#include <openpose/pose/headers.hpp>
+#include <openpose/utilities/headers.hpp>
+
+
+namespace FA{
+    struct TrackingInfo{
+        bool tracking_ = false;
+        bool recognized = false;
+        int class_id_ = -1;
+        string name_ = "unknown";
+
+        void reset(){
+            tracking_ = false;
+            recognized = false;
+            class_id_ = -1;
+            name_ = "unknown";
+        }
+    };
+    
+    
+    class FaceAlignmentInput{
+        public:
+            FaceAlignmentInput(){}
+            FaceAlignmentInput(int nMaxFaceNum, const string& strClnModelDir, const string& strFAModelDir, const string& strFATrainFileDir);
+            void SetMatCameraFrame(const Mat&);
+            void SetFaceRect(const vector<Rect>&);
+            void SetFiveInitLandmarks(vector<float>& , std::vector<std::vector<cv::Point> >&);
+            void detect();
+            Mat GetMatCameraFrame();
+            vector<Rect> GetFaceRect();
+            vector<cl::FaceLandmark> GetPerFrameLandmarks();
+            void RemoveOverlapRect(const vector<std::shared_ptr<CLNF> >& ,
+                                   vector<cl::FaceLandmark>& );
+            vector<cl::FaceBox> GetAllRect(const vector<std::shared_ptr<CLNF> >& );
+            
+        private:
+            std::vector<std::shared_ptr<CLNF> >m_vsptrCLNFModels;
+            std::shared_ptr<OPFace>m_sptrOPFace;
+            Mat m_matCameraFrame;
+            vector<Rect>m_vrectFaceRect;
+            FaceModelParameters m_fmpModelParam;
+            vector<TrackingInfo> m_vTrackingInfo;
+            vector<cl::FaceLandmark> m_vflmFiveInitLandmarks;
+            vector<cl::FaceLandmark> m_vflmPerFrameLandmarks;
+            int nFrameCount;
+            int nDetectFrequency;
+    };
+}
+
+#endif
